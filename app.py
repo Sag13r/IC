@@ -136,38 +136,6 @@ SECTOR_LISTS = {
     "Custom (fill your own)": [],
 }
 
-# ------------------------- SIDEBAR CONTROLS -------------------------
-
-st.sidebar.header("Watchlist")
-
-sector_choice = st.sidebar.selectbox(
-    "Pick a sector — stocks load automatically",
-    options=list(SECTOR_LISTS.keys()),
-)
-
-symbols = list(SECTOR_LISTS[sector_choice])
-symbol_to_sector = {sym: sector_choice for sym in symbols}
-
-st.sidebar.caption(f"📋 {len(symbols)} stock(s) in current watchlist")
-if symbols:
-    with st.sidebar.expander("View current watchlist"):
-        st.write(", ".join(symbols))
-
-st.sidebar.header("Settings")
-
-gap_threshold = st.sidebar.number_input(
-    "Minimum gap % (either direction)", value=0.4, step=0.1, min_value=0.0
-)
-confirm_candles = st.sidebar.number_input(
-    "Candles that must hold the range after gap day", value=2, step=1, min_value=1
-)
-history_period = st.sidebar.selectbox(
-    "History to fetch per symbol", options=["1mo", "3mo", "6mo", "1y", "2y"], index=2
-)
-
-with st.sidebar.container(key="run_scan_btn_wrap"):
-    run_button = st.button("🔍 Run Scan", type="primary", use_container_width=True)
-
 # Sector color palette for the stacked bar chart (mirrors Chartink's
 # colored-legend style)
 SECTOR_COLORS = {
@@ -277,6 +245,55 @@ def find_all_patterns(df: pd.DataFrame, gap_pct_min: float, confirm_n: int) -> l
     return matches
 
 
+def find_range_explorer_patterns(df: pd.DataFrame, hold_n: int) -> list[dict]:
+    """RANGE EXPLORER pattern: any 'mother candle' (anchor) whose High/Low
+    range CONTAINS the Open and Close of the next hold_n candles - those
+    candles' wicks (High/Low) are allowed to poke outside the range, only
+    their Open and Close must stay within [anchor_low, anchor_high].
+    No gap condition required for the anchor candle itself."""
+    df = df.reset_index(drop=True)
+    n = len(df)
+    matches = []
+
+    for i in range(n):
+        if i + hold_n >= n:
+            continue  # not enough candles after anchor yet to fully confirm
+
+        anchor_high = float(df["High"].iloc[i])
+        anchor_low = float(df["Low"].iloc[i])
+
+        broken = False
+        for j in range(i + 1, i + 1 + hold_n):
+            o = float(df["Open"].iloc[j])
+            c = float(df["Close"].iloc[j])
+            if o > anchor_high or o < anchor_low or c > anchor_high or c < anchor_low:
+                broken = True
+                break
+
+        if broken:
+            continue
+
+        complete_idx = i + hold_n
+        complete_close = float(df["Close"].iloc[complete_idx])
+        prev_day_close = float(df["Close"].iloc[complete_idx - 1])
+        complete_pct_change = round((complete_close - prev_day_close) / prev_day_close * 100, 2)
+        complete_volume = int(df["Volume"].iloc[complete_idx]) if "Volume" in df.columns else None
+
+        matches.append({
+            "range_high": anchor_high,
+            "range_low": anchor_low,
+            "status": "CONFIRMED",
+            "confirmed_candles": hold_n,
+            "gap_date": str(df["Date"].iloc[i].date()) if "Date" in df.columns else str(i),
+            "confirm_complete_date": str(df["Date"].iloc[complete_idx].date()) if "Date" in df.columns else str(complete_idx),
+            "close": round(complete_close, 2),
+            "pct_change": complete_pct_change,
+            "volume": complete_volume,
+        })
+
+    return matches
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_history(symbol: str, period: str) -> pd.DataFrame:
     df = yf.download(symbol, period=period, interval="1d", progress=False, auto_adjust=True)
@@ -290,7 +307,7 @@ def fetch_history(symbol: str, period: str) -> pd.DataFrame:
     return df
 
 
-def run_screener(symbols: list[str], gap_pct_min: float, confirm_n: int, period: str) -> pd.DataFrame:
+def run_screener(symbols: list[str], scan_type: str, gap_pct_min: float, confirm_n: int, period: str) -> pd.DataFrame:
     rows = []
     progress = st.progress(0.0, text="Scanning...")
     for idx, sym in enumerate(symbols):
@@ -298,7 +315,10 @@ def run_screener(symbols: list[str], gap_pct_min: float, confirm_n: int, period:
         try:
             df = fetch_history(ticker, period)
             if not df.empty:
-                matches = find_all_patterns(df, gap_pct_min, confirm_n)
+                if scan_type == "RANGE EXPLORER":
+                    matches = find_range_explorer_patterns(df, confirm_n)
+                else:
+                    matches = find_all_patterns(df, gap_pct_min, confirm_n)
                 for pattern in matches:
                     pattern["symbol"] = sym.strip().upper()
                     rows.append(pattern)
@@ -333,10 +353,6 @@ st.markdown("""
         font-size: 26px;
     }
     h3 { color: #d6336c !important; }
-    section[data-testid="stSidebar"] {
-        background-color: #F7F8FA;
-        border-right: 1px solid #e5e7eb;
-    }
     /* default button color (Run Scan) - pink/orange */
     .stButton>button {
         background: linear-gradient(90deg, #e6396b, #ff7e5f);
@@ -374,15 +390,44 @@ st.markdown("""
     }
 </style>
 <div class="app-title-banner">
-    <h1>📊 Gap-and-Hold Range Screener</h1>
+    <h1>📊 IC & RANGE EXPLORER</h1>
 </div>
 """, unsafe_allow_html=True)
 
+# ---- 4-box control row: SELECT SETUP | SECTOR | BACKTEST HISTORY | RUN ----
+col_setup, col_sector, col_history, col_run = st.columns([1, 1, 1, 1])
+
+with col_setup:
+    scan_type = st.selectbox("SELECT SETUP", options=["IC", "RANGE EXPLORER"])
+
+with col_sector:
+    sector_choice = st.selectbox("SECTOR", options=list(SECTOR_LISTS.keys()))
+
+with col_history:
+    history_period = st.selectbox("BACKTEST HISTORY", options=["1mo", "3mo", "6mo", "1y", "2y"], index=2)
+
+with col_run:
+    st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)  # align button with the boxes above
+    with st.container(key="run_scan_btn_wrap"):
+        run_button = st.button("🔍 Run Scan", type="primary", use_container_width=True)
+
+symbols = list(SECTOR_LISTS[sector_choice])
+symbol_to_sector = {sym: sector_choice for sym in symbols}
+
+# scan-specific parameters are now fixed defaults (not shown on screen) -
+# this doesn't change how either scan behaves, just hides the dials
+if scan_type == "RANGE EXPLORER":
+    gap_threshold = 0.0  # unused for this scan
+    confirm_candles = 5  # candles that must stay inside the mother candle (Open/Close only)
+else:
+    gap_threshold = 0.4      # minimum gap % (either direction)
+    confirm_candles = 2      # candles that must hold the range after gap day
+
 if run_button:
     if not symbols:
-        st.error("Pick at least one sector to build your watchlist.")
+        st.error("Pick a sector to build your watchlist.")
     else:
-        result_df = run_screener(symbols, gap_threshold, confirm_candles, history_period)
+        result_df = run_screener(symbols, scan_type, gap_threshold, confirm_candles, history_period)
         if not result_df.empty:
             result_df["sector"] = result_df["symbol"].map(symbol_to_sector).fillna("n/a")
         st.session_state["result_df"] = result_df
@@ -424,6 +469,7 @@ if "result_df" in st.session_state:
         show_detail = st.session_state.get("show_detail", False)
 
         if not show_detail:
+          with st.container(key="chart_section"):
             # ---- Excel-style horizontal scrollbar (slider) to move through history ----
             WINDOW_SIZE = 30
             max_start = max(0, len(all_dates_sorted) - WINDOW_SIZE)
@@ -504,6 +550,7 @@ if "result_df" in st.session_state:
                         st.rerun()
 
         else:
+          with st.container(key="detail_section"):
             # ---- Detail view: Back button + Prev/Next + Symbol/Date table only ----
             if st.button("← Back"):
                 st.session_state["show_detail"] = False
@@ -552,5 +599,3 @@ if "result_df" in st.session_state:
 
         csv = result_df.to_csv(index=False).encode("utf-8")
         st.download_button("Download full history as CSV", csv, "results.csv", "text/csv")
-else:
-    st.info("Edit your watchlist and settings on the left, then click **Run Scan**.")
