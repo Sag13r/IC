@@ -294,9 +294,65 @@ def find_range_explorer_patterns(df: pd.DataFrame, hold_n: int) -> list[dict]:
     return matches
 
 
+def find_nr7_near_ath_patterns(df: pd.DataFrame, ath_pct_threshold: float, history_period: str) -> list[dict]:
+    """NR7 setup, filtered to stocks trading within ath_pct_threshold% of
+    their all-time high (as of that day - uses an expanding/running ATH so
+    there's no lookahead bias in the backtest).
+
+    NR7 = today's High-Low range is the narrowest of the last 7 sessions.
+    This is a same-day snapshot condition (no forward confirmation needed,
+    unlike IC/RANGE EXPLORER) - if it's true on a day, that day is a hit.
+    """
+    df = df.reset_index(drop=True)
+    n = len(df)
+    if n < 7 or "Date" not in df.columns:
+        return []
+
+    ath_so_far = df["High"].expanding().max()
+    day_range = df["High"] - df["Low"]
+
+    matches = []
+    for i in range(6, n):
+        recent_ranges = day_range.iloc[i - 6:i + 1]
+        if day_range.iloc[i] != recent_ranges.min():
+            continue  # not the narrowest of the last 7 sessions
+
+        ath = float(ath_so_far.iloc[i])
+        close = float(df["Close"].iloc[i])
+        if ath <= 0:
+            continue
+        pct_from_ath = (ath - close) / ath * 100
+        if pct_from_ath > ath_pct_threshold:
+            continue  # too far below its all-time-high-so-far
+
+        prev_close = float(df["Close"].iloc[i - 1])
+        pct_change = round((close - prev_close) / prev_close * 100, 2)
+        volume = int(df["Volume"].iloc[i]) if "Volume" in df.columns else None
+        day_date = str(df["Date"].iloc[i].date())
+
+        matches.append({
+            "gap_date": day_date,
+            "confirm_complete_date": day_date,
+            "status": "CONFIRMED",
+            "close": round(close, 2),
+            "pct_change": pct_change,
+            "volume": volume,
+            "pct_from_ath": round(pct_from_ath, 2),
+        })
+
+    # only keep matches within the selected backtest window - the ATH itself
+    # still uses full history, this just trims which HITS get shown
+    cutoff_days = {"1mo": 30, "3mo": 90, "6mo": 182, "1y": 365, "2y": 730}.get(history_period, 182)
+    if matches:
+        cutoff_date = (datetime.now() - timedelta(days=cutoff_days)).date()
+        matches = [m for m in matches if datetime.strptime(m["gap_date"], "%Y-%m-%d").date() >= cutoff_date]
+
+    return matches
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_history(symbol: str, period: str) -> pd.DataFrame:
-    df = yf.download(symbol, period=period, interval="1d", progress=False, auto_adjust=True)
+    df = yf.download(symbol, period=period, interval="1d", progress=False, auto_adjust=False)
     if not df.empty:
         # newer yfinance versions return MultiIndex columns even for a
         # single symbol (e.g. ('Close', 'INFY.NS')) - flatten them so the
@@ -313,10 +369,17 @@ def run_screener(symbols: list[str], scan_type: str, gap_pct_min: float, confirm
     for idx, sym in enumerate(symbols):
         ticker = f"{sym.strip().upper()}.NS"
         try:
-            df = fetch_history(ticker, period)
+            if scan_type == "NR7":
+                # NR7-near-ATH needs the FULL price history to compute a
+                # true all-time-high, regardless of the selected backtest window
+                df = fetch_history(ticker, "max")
+            else:
+                df = fetch_history(ticker, period)
             if not df.empty:
                 if scan_type == "RANGE EXPLORER":
                     matches = find_range_explorer_patterns(df, confirm_n)
+                elif scan_type == "NR7":
+                    matches = find_nr7_near_ath_patterns(df, ath_pct_threshold=5.0, history_period=period)
                 else:
                     matches = find_all_patterns(df, gap_pct_min, confirm_n)
                 for pattern in matches:
@@ -328,7 +391,8 @@ def run_screener(symbols: list[str], scan_type: str, gap_pct_min: float, confirm
     progress.empty()
 
     cols = ["symbol", "gap_date", "confirm_complete_date", "status", "gap_pct",
-            "range_low", "range_high", "confirmed_candles", "close", "pct_change", "volume"]
+            "range_low", "range_high", "confirmed_candles", "close", "pct_change",
+            "volume", "pct_from_ath"]
     result = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
     if not result.empty:
         # most recent occurrences first, like Chartink's backtest view
@@ -398,7 +462,7 @@ st.markdown("""
 col_setup, col_sector, col_history, col_run = st.columns([1, 1, 1, 1])
 
 with col_setup:
-    scan_type = st.selectbox("SELECT SETUP", options=["IC", "RANGE EXPLORER"])
+    scan_type = st.selectbox("SELECT SETUP", options=["IC", "RANGE EXPLORER", "NR7"])
 
 with col_sector:
     sector_choice = st.selectbox("SECTOR", options=list(SECTOR_LISTS.keys()))
@@ -415,10 +479,13 @@ symbols = list(SECTOR_LISTS[sector_choice])
 symbol_to_sector = {sym: sector_choice for sym in symbols}
 
 # scan-specific parameters are now fixed defaults (not shown on screen) -
-# this doesn't change how either scan behaves, just hides the dials
+# this doesn't change how any scan behaves, just hides the dials
 if scan_type == "RANGE EXPLORER":
     gap_threshold = 0.0  # unused for this scan
     confirm_candles = 5  # candles that must stay inside the mother candle (Open/Close only)
+elif scan_type == "NR7":
+    gap_threshold = 0.0   # unused for this scan
+    confirm_candles = 7   # unused directly (NR7 window is fixed at 7 by definition) - harmless placeholder
 else:
     gap_threshold = 0.4      # minimum gap % (either direction)
     confirm_candles = 2      # candles that must hold the range after gap day
@@ -471,7 +538,7 @@ if "result_df" in st.session_state:
         if not show_detail:
           with st.container(key="chart_section"):
             # ---- Excel-style horizontal scrollbar (slider) to move through history ----
-            WINDOW_SIZE = 30
+            WINDOW_SIZE = 12
             max_start = max(0, len(all_dates_sorted) - WINDOW_SIZE)
             if max_start > 0:
                 scroll_pos = st.slider(
@@ -504,7 +571,7 @@ if "result_df" in st.session_state:
                 hoverlabel=dict(bgcolor="white", font_size=13, bordercolor="#e6396b"),
                 dragmode=False,  # no drag/pan directly on chart - use the slider above instead
                 barmode="stack",
-                bargap=0.55,  # thin bars, like the reference screenshot
+                bargap=0.35,  # wider bars now that fewer show per screen - easier to tap on mobile
                 legend=dict(
                     orientation="h", yanchor="bottom", y=-0.35, xanchor="center", x=0.5,
                     title=None,
