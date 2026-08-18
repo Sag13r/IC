@@ -1,0 +1,723 @@
+"""
+Gap-and-Hold Range Screener — Streamlit web app
+-------------------------------------------------
+Run locally:
+    pip install streamlit yfinance pandas
+    streamlit run app.py
+
+Deploy free (so you can open it from your phone anytime):
+    1. Push this file + requirements.txt to a GitHub repo
+    2. Go to share.streamlit.io -> New app -> connect the repo
+    3. You get a permanent URL, e.g. yourname-screener.streamlit.app
+
+Pattern rule:
+  Day 1 (gap day): opens with a gap (up OR down) of at least GAP_THRESHOLD_PCT
+                   vs previous close. This candle's High/Low = "the range".
+  Day 2, Day 3   : neither candle's High may exceed Day-1 High, nor its Low
+                   go below Day-1 Low. Touching exactly is fine — only
+                   breaking BEYOND it is a violation.
+"""
+
+import streamlit as st
+import pandas as pd
+import yfinance as yf
+import plotly.express as px
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+st.set_page_config(page_title="Gap-and-Hold Screener", layout="wide")
+
+# ------------------------- SECTOR WATCHLISTS -------------------------
+# NOTE: NSE sectoral indices are rebalanced twice a year (cut-offs: Jan 31 &
+# Jul 31). These lists are the current constituents as of building this app -
+# treat them as a starting point and edit freely if a stock is added/removed
+# later. Symbols below are plain NSE tickers (the app adds ".NS" itself).
+
+SECTOR_LISTS = {
+    "CNXIT": [
+        "COFORGE", "HCLTECH", "INFY", "LTM", "MPHASIS", "OFSS",
+        "PERSISTENT", "TCS", "TECHM", "WIPRO",
+    ],
+    "CNXFINANCE": [
+        "AXISBANK", "BSE", "BAJFINANCE", "BAJAJFINSV", "CHOLAFIN",
+        "HDFCLIFE", "HDFCBANK", "ICICIGI", "ICICIPRULI", "ICICIBANK",
+        "JIOFIN", "KOTAKBANK", "LICHSGFIN", "MUTHOOTFIN", "PFC",
+        "RECLTD", "SBICARD", "SBILIFE", "SHRIRAMFIN", "SBIN",
+    ],
+    "NIFTYPVTBANK": [
+        "AXISBANK", "BANDHANBNK", "HDFCBANK", "IDFCFIRSTB", "ICICIBANK",
+        "INDUSINDBK", "KOTAKBANK", "RBLBANK", "FEDERALBNK", "YESBANK",
+    ],
+    "CNXPSUBANK": [
+        "BANKBARODA", "BANKINDIA", "MAHABANK", "CANBK", "CENTRALBK",
+        "INDIANB", "PSB", "IOB", "PNB", "SBIN", "UCOBANK", "UNIONBANK",
+    ],
+    "CNXMETAL": [
+        "ADANIENT", "APLAPOLLO", "HINDALCO", "HINDCOPPER", "HINDZINC",
+        "JSL", "JINDALSTEL", "JSWSTEEL", "LLOYDSME", "NATIONALUM",
+        "NMDC", "SAIL", "TATASTEEL", "VEDL", "WELCORP",
+    ],
+    "CNXAUTO": [
+        "ASHOKLEY", "BAJAJ-AUTO", "BHARATFORG", "BOSCHLTD", "EICHERMOT",
+        "EXIDEIND", "HEROMOTOCO", "M&M", "MARUTI", "MOTHERSON",
+        "SONACOMS", "TMPV", "TIINDIA", "TVSMOTOR", "UNOMINDA",
+    ],
+    "CNXFMCG": [
+        "BRITANNIA", "COLPAL", "DABUR", "EMAMILTD", "HINDUNILVR", "ITC",
+        "MARICO", "NESTLEIND", "PATANJALI", "RADICO", "TATACONSUM",
+        "UBL", "UNITDSPR", "VBL",
+    ],
+    "CNXENERGY": [
+        "ABB", "ADANIENSOL", "ADANIGREEN", "ADANIPOWER", "ATGL",
+        "AEGISLOG", "BHEL", "BPCL", "CGPOWER", "CASTROLIND", "CESC",
+        "COALINDIA", "GVT&D", "GAIL", "GUJGASLTD", "GSPL", "HINDPETRO",
+        "POWERINDIA", "IOC", "IGL", "INOXWIND", "JPPOWER", "JSWENERGY",
+        "MGL", "NHPC", "NLCINDIA", "NTPC", "ONGC", "OIL", "PETRONET",
+        "POWERGRID", "RELIANCE", "RPOWER", "ENRIN", "SIEMENS", "SJVN",
+        "SUZLON", "TATAPOWER", "THERMAX", "TORNTPOWER",
+    ],
+    "CNXPHARMA": [
+        "ABBOTINDIA", "AJANTPHARM", "ALKEM", "AUROPHARMA", "BIOCON",
+        "CIPLA", "DIVISLAB", "DRREDDY", "GLAND", "GLENMARK", "IPCALAB",
+        "JBCHEPHARM", "LAURUSLABS", "LUPIN", "MANKIND", "PPLPHARMA",
+        "SUNPHARMA", "TORNTPHARM", "WOCKPHARMA", "ZYDUSLIFE",
+    ],
+    "NIFTY_HEALTHCARE": [
+        "ABBOTINDIA", "ALKEM", "APOLLOHOSP", "AUROPHARMA", "BIOCON",
+        "CIPLA", "DIVISLAB", "DRREDDY", "FORTIS", "GLENMARK", "IPCALAB",
+        "LAURUSLABS", "LUPIN", "MANKIND", "MAXHEALTH", "PPLPHARMA",
+        "SUNPHARMA", "SYNGENE", "TORNTPHARM", "ZYDUSLIFE",
+    ],
+    "NIFTY_CAPITAL_MKT": [
+        "360ONE", "ABSLAMC", "ANANDRATHI", "ANGELONE", "BSE", "CDSL",
+        "CAMS", "HDFCAMC", "IEX", "KFINTECH", "MOTILALOFS", "MCX",
+        "NAM_INDIA", "NUVAMA", "UTIAMC",
+    ],
+    "NIFTY_IND_DEFENCE": [
+        "ASTRAMICRO", "BEML", "BDL", "BEL", "BHARATFORG", "COCHINSHIP",
+        "CYIENTDLM", "DATAPATTNS", "DYNAMATECH", "GRSE", "HAL",
+        "MTARTECH", "MAZDOCK", "MIDHANI", "PARAS", "SOLARINDS",
+        "UNIMECH", "ZENTEC",
+    ],
+    "NIFTY_CONSR_DURBL": [
+        "AMBER", "BATAINDIA", "BLUESTARCO", "CENTURYPLY", "CERA",
+        "CROMPTON", "DIXON", "HAVELLS", "KAJARIACER", "KALYANKJIL",
+        "PGEL", "TITAN", "VGUARD", "VOLTAS", "WHIRLPOOL",
+    ],
+    "NIFTY_CHEMICALS": [
+        "AARTIIND", "ATUL", "BAYERCROP", "CHAMBLFERT", "COROMANDEL",
+        "DEEPAKFERT", "DEEPAKNTR", "FLUOROCHEM", "HSCL", "LINDEINDIA",
+        "NAVINFLUOR", "PCBL", "PIIND", "PIDILITIND", "SOLARINDS", "SRF",
+        "SUMICHEM", "SWANCORP", "TATACHEM", "UPL",
+    ],
+    "CPSE": [
+        "BEL", "COALINDIA", "COCHINSHIP", "NBCC", "NHPC", "NLCINDIA",
+        "NTPC", "ONGC", "OIL", "POWERGRID", "SJVN",
+    ],
+    "CNXMEDIA": [
+        "DBCORP", "HATHWAY", "NAZARA", "NETWORK18", "PVRINOX", "PFOCUS",
+        "SAREGAMA", "SUNTV", "TIPSMUSIC", "ZEEL",
+    ],
+    "NIFTY_MS_IT_TELCM": [
+        "AFFLE", "BHARTIHEXA", "BSOFT", "COFORGE", "CYIENT", "HFCL",
+        "HEXT", "INDUSTOWER", "INTELLECT", "KPITTECH", "LTTS", "MPHASIS",
+        "OFSS", "PERSISTENT", "SONATSOFTW", "TATACOMM", "TATAELXSI",
+        "TATATECH", "ZENSARTECH",
+    ],
+    "CNXREALTY": [
+        "ANANTRAJ", "BRIGADE", "DLF", "GODREJPROP", "LODHA",
+        "OBEROIRLTY", "PRESTIGE", "SIGNATURE", "SOBHA", "PHOENIXLTD",
+    ],
+    "NIFTY_IND_TOURISM": [
+        "BLS", "CHALET", "DEVYANI", "EIHOTEL", "GMRAIRPORT", "ITCHOTELS",
+        "IRCTC", "INDIGO", "JUBLFOOD", "THELEELA", "LEMONTREE",
+        "SAPPHIRE", "TBOTEK", "INDHOTEL", "DBREALTY", "VENTIVE",
+    ],
+    "Custom (fill your own)": [],
+}
+
+# ------------------------- F&O UNIVERSE (for NR7) -------------------------
+# Official list of all individual securities with F&O contracts on NSE,
+# pulled directly from nseindia.com (Equity Derivatives > List of
+# Underlyings and Information) on 18-Aug-2026. NSE revises this list
+# periodically (they dropped 16 securities from F&O as recently as
+# Feb-2025) - worth re-checking that same NSE page occasionally.
+FNO_STOCKS = [
+    "360ONE", "ABB", "APLAPOLLO", "AUBANK", "ADANIENSOL", "ADANIENT",
+    "ADANIGREEN", "ADANIPORTS", "ADANIPOWER", "ABCAPITAL", "ALKEM",
+    "AMBER", "AMBUJACEM", "ANGELONE", "APOLLOHOSP", "ASHOKLEY",
+    "ASIANPAINT", "ASTRAL", "AUROPHARMA", "DMART", "AXISBANK", "BSE",
+    "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BAJAJHLDNG", "BANDHANBNK",
+    "BANKBARODA", "BANKINDIA", "BDL", "BEL", "BHARATFORG", "BHEL",
+    "BPCL", "BHARTIARTL", "BIOCON", "BLUESTARCO", "BOSCHLTD",
+    "BRITANNIA", "CGPOWER", "CANBK", "CDSL", "CHOLAFIN", "CIPLA",
+    "COALINDIA", "COCHINSHIP", "COFORGE", "COLPAL", "CAMS", "CONCOR",
+    "CROMPTON", "CUMMINSIND", "DLF", "DABUR", "DALBHARAT", "DELHIVERY",
+    "DIVISLAB", "DIXON", "DRREDDY", "ETERNAL", "EICHERMOT", "FORCEMOT",
+    "NYKAA", "FORTIS", "GAIL", "GVT&D", "GMRAIRPORT", "GLENMARK",
+    "GODFRYPHLP", "GODREJCP", "GODREJPROP", "GRASIM", "HCLTECH",
+    "HDFCAMC", "HDFCBANK", "HDFCLIFE", "HAVELLS", "HEROMOTOCO",
+    "HINDALCO", "HAL", "HINDPETRO", "HINDUNILVR", "HINDZINC",
+    "POWERINDIA", "HYUNDAI", "ICICIBANK", "ICICIGI", "ICICIPRULI",
+    "IDFCFIRSTB", "ITC", "INDIANB", "IEX", "IOC", "IRFC", "IREDA",
+    "INDUSTOWER", "INDUSINDBK", "NAUKRI", "INFY", "INOXWIND", "INDIGO",
+    "JINDALSTEL", "JSWENERGY", "JSWSTEEL", "JIOFIN", "JUBLFOOD", "KEI",
+    "KPITTECH", "KALYANKJIL", "KAYNES", "KFINTECH", "KOTAKBANK", "LTF",
+    "LICHSGFIN", "LTM", "LT", "LAURUSLABS", "LICI", "LODHA", "LUPIN",
+    "M&M", "MANAPPURAM", "MANKIND", "MARICO", "MARUTI", "MFSL",
+    "MAXHEALTH", "MAZDOCK", "MOTILALOFS", "MPHASIS", "MCX", "MUTHOOTFIN",
+    "NBCC", "NHPC", "NMDC", "NTPC", "NATIONALUM", "NESTLEIND",
+    "NAM-INDIA", "OBEROIRLTY", "ONGC", "OIL", "PAYTM", "OFSS",
+    "POLICYBZR", "PGEL", "PIIND", "PNBHOUSING", "PAGEIND", "PATANJALI",
+    "PERSISTENT", "PETRONET", "PIDILITIND", "POLYCAB", "PFC",
+    "POWERGRID", "PREMIERENE", "PRESTIGE", "PNB", "RBLBANK", "RECLTD",
+    "RADICO", "RVNL", "RELIANCE", "SBICARD", "SBILIFE", "SHREECEM",
+    "SRF", "MOTHERSON", "SHRIRAMFIN", "SIEMENS", "SOLARINDS", "SONACOMS",
+    "SBIN", "SAIL", "SUNPHARMA", "SUPREMEIND", "SUZLON", "SWIGGY",
+    "TATACONSUM", "TVSMOTOR", "TCS", "TATAELXSI", "TMPV", "TATAPOWER",
+    "TATASTEEL", "TECHM", "FEDERALBNK", "INDHOTEL", "PHOENIXLTD",
+    "TITAN", "TORNTPHARM", "TRENT", "TIINDIA", "UNOMINDA", "UPL",
+    "ULTRACEMCO", "UNIONBANK", "UNITDSPR", "VBL", "VEDL", "VMM", "IDEA",
+    "VOLTAS", "WAAREEENER", "WIPRO", "YESBANK", "ZYDUSLIFE",
+]
+
+# Sector color palette for the stacked bar chart (mirrors Chartink's
+# colored-legend style)
+SECTOR_COLORS = {
+    "CNXIT": "#29ABE2",
+    "CNXFINANCE": "#F4511E",
+    "NIFTYPVTBANK": "#E91E63",
+    "CNXPSUBANK": "#8E24AA",
+    "CNXMETAL": "#43A047",
+    "CNXAUTO": "#1E88E5",
+    "CNXFMCG": "#FB8C00",
+    "CNXENERGY": "#FDD835",
+    "CNXPHARMA": "#00ACC1",
+    "NIFTY_HEALTHCARE": "#7B1FA2",
+    "NIFTY_CAPITAL_MKT": "#6D4C41",
+    "NIFTY_IND_DEFENCE": "#26A69A",
+    "NIFTY_CONSR_DURBL": "#EC407A",
+    "NIFTY_CHEMICALS": "#00796B",
+    "CPSE": "#5C6BC0",
+    "CNXMEDIA": "#FF7043",
+    "NIFTY_MS_IT_TELCM": "#42A5F5",
+    "CNXREALTY": "#9CCC65",
+    "NIFTY_IND_TOURISM": "#AB47BC",
+    "Custom (fill your own)": "#78909C",
+    "FNO": "#0EA5E9",
+    "n/a": "#B0BEC5",
+}
+
+
+def get_expected_trading_date():
+    """
+    Returns the date that 'Latest Result' should match against, based on
+    real-world IST day/time:
+      - Monday to Friday: today's own date (strict, no fallback)
+      - Saturday: Friday's date (market was closed today)
+      - Sunday, before 11:55 PM IST: Friday's date
+      - Sunday, after 11:55 PM IST: None -> nothing should show
+        (Monday's own session hasn't happened/updated yet)
+    """
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+    weekday = now_ist.weekday()  # Monday=0 ... Sunday=6
+    today_date = now_ist.date()
+
+    if weekday <= 4:  # Monday(0) - Friday(4)
+        return today_date
+    elif weekday == 5:  # Saturday
+        return today_date - timedelta(days=1)  # last Friday
+    else:  # Sunday (6)
+        cutoff = now_ist.replace(hour=23, minute=55, second=0, microsecond=0)
+        if now_ist <= cutoff:
+            return today_date - timedelta(days=2)  # last Friday
+        return None
+
+
+# ------------------------- CORE LOGIC -------------------------
+
+
+def find_all_patterns(df: pd.DataFrame, gap_pct_min: float, confirm_n: int) -> list[dict]:
+    """Scan the ENTIRE history given (not just recent days) and return every
+    time the gap-and-hold pattern FULLY completed - gap day + all confirm_n
+    candles held inside the range. Partial/still-forming setups (where we
+    don't yet have enough candles to confirm) are NOT included."""
+    df = df.reset_index(drop=True)
+    n = len(df)
+    matches = []
+
+    for i in range(1, n):
+        prev_close = float(df["Close"].iloc[i - 1])
+        gap_pct = (float(df["Open"].iloc[i]) - prev_close) / prev_close * 100
+
+        if abs(gap_pct) < gap_pct_min:
+            continue
+
+        # not enough candles left after the gap day to fully confirm yet - skip
+        if i + confirm_n >= n:
+            continue
+
+        range_high = float(df["High"].iloc[i])
+        range_low = float(df["Low"].iloc[i])
+
+        broken = False
+        for j in range(i + 1, i + 1 + confirm_n):
+            if float(df["High"].iloc[j]) > range_high or float(df["Low"].iloc[j]) < range_low:
+                broken = True
+                break
+
+        if broken:
+            continue  # setup invalidated - do NOT include
+
+        complete_idx = i + confirm_n
+        complete_close = float(df["Close"].iloc[complete_idx])
+        prev_day_close = float(df["Close"].iloc[complete_idx - 1])
+        complete_pct_change = round((complete_close - prev_day_close) / prev_day_close * 100, 2)
+        complete_volume = int(df["Volume"].iloc[complete_idx]) if "Volume" in df.columns else None
+
+        matches.append({
+            "gap_pct": round(gap_pct, 2),
+            "range_high": range_high,
+            "range_low": range_low,
+            "status": "CONFIRMED",
+            "confirmed_candles": confirm_n,
+            "gap_date": str(df["Date"].iloc[i].date()) if "Date" in df.columns else str(i),
+            "confirm_complete_date": str(df["Date"].iloc[complete_idx].date()) if "Date" in df.columns else str(complete_idx),
+            "close": round(complete_close, 2),
+            "pct_change": complete_pct_change,
+            "volume": complete_volume,
+        })
+
+    return matches
+
+
+def find_range_explorer_patterns(df: pd.DataFrame, hold_n: int) -> list[dict]:
+    """RANGE EXPLORER pattern: any 'mother candle' (anchor) whose High/Low
+    range CONTAINS the Open and Close of the next hold_n candles - those
+    candles' wicks (High/Low) are allowed to poke outside the range, only
+    their Open and Close must stay within [anchor_low, anchor_high].
+    No gap condition required for the anchor candle itself."""
+    df = df.reset_index(drop=True)
+    n = len(df)
+    matches = []
+
+    for i in range(n):
+        if i + hold_n >= n:
+            continue  # not enough candles after anchor yet to fully confirm
+
+        anchor_high = float(df["High"].iloc[i])
+        anchor_low = float(df["Low"].iloc[i])
+
+        broken = False
+        for j in range(i + 1, i + 1 + hold_n):
+            o = float(df["Open"].iloc[j])
+            c = float(df["Close"].iloc[j])
+            if o > anchor_high or o < anchor_low or c > anchor_high or c < anchor_low:
+                broken = True
+                break
+
+        if broken:
+            continue
+
+        complete_idx = i + hold_n
+        complete_close = float(df["Close"].iloc[complete_idx])
+        prev_day_close = float(df["Close"].iloc[complete_idx - 1])
+        complete_pct_change = round((complete_close - prev_day_close) / prev_day_close * 100, 2)
+        complete_volume = int(df["Volume"].iloc[complete_idx]) if "Volume" in df.columns else None
+
+        matches.append({
+            "range_high": anchor_high,
+            "range_low": anchor_low,
+            "status": "CONFIRMED",
+            "confirmed_candles": hold_n,
+            "gap_date": str(df["Date"].iloc[i].date()) if "Date" in df.columns else str(i),
+            "confirm_complete_date": str(df["Date"].iloc[complete_idx].date()) if "Date" in df.columns else str(complete_idx),
+            "close": round(complete_close, 2),
+            "pct_change": complete_pct_change,
+            "volume": complete_volume,
+        })
+
+    return matches
+
+
+def find_nr7_near_ath_patterns(df: pd.DataFrame, ath_pct_threshold: float, history_period: str) -> list[dict]:
+    """NR7 setup, filtered to stocks trading within ath_pct_threshold% of
+    their all-time high (as of that day - uses an expanding/running ATH so
+    there's no lookahead bias in the backtest).
+
+    NR7 = today's High-Low range is the narrowest of the last 7 sessions.
+    This is a same-day snapshot condition (no forward confirmation needed,
+    unlike IC/RANGE EXPLORER) - if it's true on a day, that day is a hit.
+    """
+    df = df.reset_index(drop=True)
+    n = len(df)
+    if n < 7 or "Date" not in df.columns:
+        return []
+
+    ath_so_far = df["High"].expanding().max()
+    day_range = df["High"] - df["Low"]
+
+    matches = []
+    for i in range(6, n):
+        recent_ranges = day_range.iloc[i - 6:i + 1]
+        if day_range.iloc[i] != recent_ranges.min():
+            continue  # not the narrowest of the last 7 sessions
+
+        ath = float(ath_so_far.iloc[i])
+        close = float(df["Close"].iloc[i])
+        if ath <= 0:
+            continue
+        pct_from_ath = (ath - close) / ath * 100
+        if pct_from_ath > ath_pct_threshold:
+            continue  # too far below its all-time-high-so-far
+
+        prev_close = float(df["Close"].iloc[i - 1])
+        pct_change = round((close - prev_close) / prev_close * 100, 2)
+        volume = int(df["Volume"].iloc[i]) if "Volume" in df.columns else None
+        day_date = str(df["Date"].iloc[i].date())
+
+        matches.append({
+            "gap_date": day_date,
+            "confirm_complete_date": day_date,
+            "status": "CONFIRMED",
+            "close": round(close, 2),
+            "pct_change": pct_change,
+            "volume": volume,
+            "pct_from_ath": round(pct_from_ath, 2),
+        })
+
+    # only keep matches within the selected backtest window - the ATH itself
+    # still uses full history, this just trims which HITS get shown
+    cutoff_days = {"1mo": 30, "3mo": 90, "6mo": 182, "1y": 365, "2y": 730}.get(history_period, 182)
+    if matches:
+        cutoff_date = (datetime.now() - timedelta(days=cutoff_days)).date()
+        matches = [m for m in matches if datetime.strptime(m["gap_date"], "%Y-%m-%d").date() >= cutoff_date]
+
+    return matches
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_history(symbol: str, period: str) -> pd.DataFrame:
+    df = yf.download(symbol, period=period, interval="1d", progress=False, auto_adjust=False)
+    if not df.empty:
+        # newer yfinance versions return MultiIndex columns even for a
+        # single symbol (e.g. ('Close', 'INFY.NS')) - flatten them so the
+        # rest of the code can treat columns as plain 'Close', 'Open', etc.
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.reset_index()
+    return df
+
+
+def run_screener(symbols: list[str], scan_type: str, gap_pct_min: float, confirm_n: int, period: str) -> pd.DataFrame:
+    rows = []
+    progress = st.progress(0.0, text="Scanning...")
+    for idx, sym in enumerate(symbols):
+        ticker = f"{sym.strip().upper()}.NS"
+        try:
+            if scan_type == "NR7":
+                # NR7-near-ATH needs the FULL price history to compute a
+                # true all-time-high, regardless of the selected backtest window
+                df = fetch_history(ticker, "max")
+            else:
+                df = fetch_history(ticker, period)
+            if not df.empty:
+                if scan_type == "RANGE EXPLORER":
+                    matches = find_range_explorer_patterns(df, confirm_n)
+                elif scan_type == "NR7":
+                    matches = find_nr7_near_ath_patterns(df, ath_pct_threshold=5.0, history_period=period)
+                else:
+                    matches = find_all_patterns(df, gap_pct_min, confirm_n)
+                for pattern in matches:
+                    pattern["symbol"] = sym.strip().upper()
+                    rows.append(pattern)
+        except Exception as e:
+            st.warning(f"Skipped {sym}: {e}")
+        progress.progress((idx + 1) / len(symbols), text=f"Scanning... {sym}")
+    progress.empty()
+
+    cols = ["symbol", "gap_date", "confirm_complete_date", "status", "gap_pct",
+            "range_low", "range_high", "confirmed_candles", "close", "pct_change",
+            "volume", "pct_from_ath"]
+    result = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+    if not result.empty:
+        # most recent occurrences first, like Chartink's backtest view
+        result = result.sort_values("gap_date", ascending=False).reset_index(drop=True)
+    return result
+
+
+# ------------------------- MAIN PAGE -------------------------
+
+st.markdown("""
+<style>
+    .app-title-banner {
+        background: linear-gradient(90deg, #e6396b 0%, #ff7e5f 50%, #ffb347 100%);
+        padding: 18px 28px;
+        border-radius: 14px;
+        color: white;
+        margin-bottom: 18px;
+    }
+    .app-title-banner h1 {
+        color: white !important;
+        margin: 0;
+        font-size: 26px;
+    }
+    h3 { color: #d6336c !important; }
+    /* default button color (Run Scan) - pink/orange */
+    .stButton>button {
+        background: linear-gradient(90deg, #e6396b, #ff7e5f);
+        color: white;
+        border: none;
+        border-radius: 8px;
+        font-weight: 600;
+    }
+    .stButton>button:hover {
+        background: linear-gradient(90deg, #d6336c, #ff6b47);
+        color: white;
+    }
+    /* Prev/Next buttons - blue/purple */
+    .st-key-prevnext_btn_wrap .stButton>button {
+        background: linear-gradient(90deg, #4f46e5, #7c3aed);
+    }
+    .st-key-prevnext_btn_wrap .stButton>button:hover {
+        background: linear-gradient(90deg, #4338ca, #6d28d9);
+    }
+    /* Download button - green/teal */
+    div[data-testid="stDownloadButton"] button {
+        background: linear-gradient(90deg, #10b981, #059669);
+        color: white;
+        border: none;
+        border-radius: 8px;
+        font-weight: 600;
+    }
+    div[data-testid="stDownloadButton"] button:hover {
+        background: linear-gradient(90deg, #0d9488, #047857);
+        color: white;
+    }
+    div[data-testid="stDataFrame"] {
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+    }
+</style>
+<div class="app-title-banner">
+    <h1>📊 IC & RANGE EXPLORER</h1>
+</div>
+""", unsafe_allow_html=True)
+
+# ---- 4-box control row: SELECT SETUP | SECTOR | BACKTEST HISTORY | RUN ----
+col_setup, col_sector, col_history, col_run = st.columns([1, 1, 1, 1])
+
+with col_setup:
+    scan_type = st.selectbox("SELECT SETUP", options=["IC", "RANGE EXPLORER", "NR7"])
+
+with col_sector:
+    if scan_type == "NR7":
+        st.markdown("**SECTOR**")
+        st.caption(f"Fixed: full F&O universe ({len(FNO_STOCKS)} stocks)")
+        sector_choice = None
+    else:
+        sector_choice = st.selectbox("SECTOR", options=list(SECTOR_LISTS.keys()))
+
+with col_history:
+    history_period = st.selectbox("BACKTEST HISTORY", options=["1mo", "3mo", "6mo", "1y", "2y"], index=2)
+
+with col_run:
+    st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)  # align button with the boxes above
+    with st.container(key="run_scan_btn_wrap"):
+        run_button = st.button("🔍 Run Scan", type="primary", use_container_width=True)
+
+if scan_type == "NR7":
+    symbols = list(FNO_STOCKS)
+    symbol_to_sector = {sym: "FNO" for sym in symbols}
+else:
+    symbols = list(SECTOR_LISTS[sector_choice])
+    symbol_to_sector = {sym: sector_choice for sym in symbols}
+
+# scan-specific parameters are now fixed defaults (not shown on screen) -
+# this doesn't change how any scan behaves, just hides the dials
+if scan_type == "RANGE EXPLORER":
+    gap_threshold = 0.0  # unused for this scan
+    confirm_candles = 5  # candles that must stay inside the mother candle (Open/Close only)
+elif scan_type == "NR7":
+    gap_threshold = 0.0   # unused for this scan
+    confirm_candles = 7   # unused directly (NR7 window is fixed at 7 by definition) - harmless placeholder
+else:
+    gap_threshold = 0.4      # minimum gap % (either direction)
+    confirm_candles = 2      # candles that must hold the range after gap day
+
+if run_button:
+    if not symbols:
+        st.error("Pick a sector to build your watchlist.")
+    else:
+        result_df = run_screener(symbols, scan_type, gap_threshold, confirm_candles, history_period)
+        if not result_df.empty:
+            result_df["sector"] = result_df["symbol"].map(symbol_to_sector).fillna("n/a")
+        st.session_state["result_df"] = result_df
+        st.session_state.pop("selected_date_idx", None)  # reset navigation on a fresh scan
+        st.session_state.pop("_last_click_raw", None)
+        st.session_state["show_detail"] = False
+
+if "result_df" in st.session_state:
+    result_df = st.session_state["result_df"]
+    expected_date = get_expected_trading_date()
+
+    # ---- Latest Result: CONFIRMED setups whose confirmation completed on expected_date ----
+    st.subheader("🔎 Latest Result")
+    if expected_date is None or result_df.empty:
+        st.info("NO STOCK PRESENT")
+    else:
+        today_confirmed = result_df[result_df["confirm_complete_date"] == str(expected_date)].copy()
+        if today_confirmed.empty:
+            st.info("NO STOCK PRESENT")
+        else:
+            display_df = today_confirmed[["symbol", "close", "pct_change", "volume"]].rename(columns={
+                "symbol": "SYMBOL", "close": "CLOSE", "pct_change": "%CHANGE", "volume": "VOLUME",
+            }).sort_values("SYMBOL").reset_index(drop=True)
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+    if result_df.empty:
+        st.info("No qualifying patterns found in the current watchlist / history window.")
+    else:
+        st.subheader("📜 Backtest History")
+
+        counts_by_date = (
+            result_df.groupby("confirm_complete_date")["symbol"]
+            .nunique()
+            .reset_index(name="count")
+            .sort_values("confirm_complete_date")
+        )
+        all_dates_sorted = counts_by_date["confirm_complete_date"].tolist()
+
+        show_detail = st.session_state.get("show_detail", False)
+
+        if not show_detail:
+          with st.container(key="chart_section"):
+            # ---- Excel-style horizontal scrollbar (slider) to move through history ----
+            WINDOW_SIZE = 12
+            max_start = max(0, len(all_dates_sorted) - WINDOW_SIZE)
+            if max_start > 0:
+                scroll_pos = st.slider(
+                    "Scroll through history", min_value=0, max_value=max_start,
+                    value=max_start, step=1, key="chart_scroll",
+                )
+            else:
+                scroll_pos = 0
+            visible_dates = all_dates_sorted[scroll_pos:scroll_pos + WINDOW_SIZE]
+
+            # group by date AND sector for the stacked, color-coded bars (Chartink style)
+            counts_by_date_sector = (
+                result_df.groupby(["confirm_complete_date", "sector"])["symbol"]
+                .nunique()
+                .reset_index(name="count")
+            )
+            chart_df = counts_by_date_sector[counts_by_date_sector["confirm_complete_date"].isin(visible_dates)].copy()
+            chart_df["date_dt"] = pd.to_datetime(chart_df["confirm_complete_date"])
+
+            fig = px.bar(
+                chart_df, x="date_dt", y="count", color="sector",
+                color_discrete_map=SECTOR_COLORS,
+            )
+            fig.update_layout(
+                template="plotly_white",
+                paper_bgcolor="white",
+                plot_bgcolor="white",
+                xaxis_title=None, yaxis_title=None,
+                height=400, margin=dict(l=10, r=10, t=10, b=10),
+                hoverlabel=dict(bgcolor="white", font_size=13, bordercolor="#e6396b"),
+                dragmode=False,  # no drag/pan directly on chart - use the slider above instead
+                barmode="stack",
+                bargap=0.35,  # wider bars now that fewer show per screen - easier to tap on mobile
+                legend=dict(
+                    orientation="h", yanchor="bottom", y=-0.35, xanchor="center", x=0.5,
+                    title=None,
+                ),
+            )
+            visible_dt = pd.to_datetime(visible_dates)
+            fig.update_xaxes(
+                type="date",
+                range=[visible_dt.min() - pd.Timedelta(days=2), visible_dt.max() + pd.Timedelta(days=2)],
+                fixedrange=True,
+                tickformat="%b %d",
+                showgrid=True, gridcolor="#eef0f4",
+                rangebreaks=[dict(bounds=["sat", "mon"])],  # skip weekends - no trading, no gaps
+            )
+            fig.update_yaxes(fixedrange=True, showgrid=True, gridcolor="#eef0f4")
+            fig.update_traces(marker_line_width=0, hovertemplate="<b>%{x|%d-%m-%Y}</b><br>%{fullData.name}: %{y}<extra></extra>")
+
+            click_event = st.plotly_chart(
+                fig, use_container_width=True, on_select="rerun",
+                selection_mode="points", key="backtest_chart",
+                config={
+                    "scrollZoom": False,
+                    "displaylogo": False,
+                    "modeBarButtonsToRemove": [
+                        "zoomIn2d", "zoomOut2d", "zoom2d", "autoScale2d",
+                        "resetScale2d", "lasso2d", "select2d", "pan2d",
+                    ],
+                    "doubleClick": False,
+                },
+            )
+
+            if click_event and click_event.get("selection", {}).get("points"):
+                raw_clicked = click_event["selection"]["points"][0].get("x")
+                # only act if this is a genuinely NEW click - otherwise the chart's
+                # persisted selection state re-fires on the very next rerun and
+                # would immediately flip us right back into detail view
+                if raw_clicked != st.session_state.get("_last_click_raw"):
+                    st.session_state["_last_click_raw"] = raw_clicked
+                    clicked_date = str(pd.to_datetime(raw_clicked).date())
+                    if clicked_date in all_dates_sorted:
+                        st.session_state["selected_date_idx"] = all_dates_sorted.index(clicked_date)
+                        st.session_state["show_detail"] = True
+                        st.rerun()
+
+        else:
+          with st.container(key="detail_section"):
+            # ---- Detail view: Back button + Prev/Next + Symbol/Date table only ----
+            if st.button("← Back"):
+                st.session_state["show_detail"] = False
+                st.rerun()
+
+            idx = st.session_state["selected_date_idx"]
+
+            with st.container(key="prevnext_btn_wrap"):
+                col_l, col_prev, col_next, col_r = st.columns([4, 1, 1, 4])
+                with col_prev:
+                    if st.button("<< Prev", disabled=(idx <= 0)):
+                        st.session_state["selected_date_idx"] = max(0, idx - 1)
+                        st.rerun()
+                with col_next:
+                    if st.button("Next >>", disabled=(idx >= len(all_dates_sorted) - 1)):
+                        st.session_state["selected_date_idx"] = min(len(all_dates_sorted) - 1, idx + 1)
+                        st.rerun()
+
+            selected_date = all_dates_sorted[st.session_state["selected_date_idx"]]
+            day_df = result_df[result_df["confirm_complete_date"] == selected_date][
+                ["symbol", "confirm_complete_date"]
+            ].rename(columns={"symbol": "SYMBOL", "confirm_complete_date": "DATE"}).sort_values("SYMBOL").reset_index(drop=True)
+
+            # custom compact table - light blue header, alternating light blue/white
+            # rows, no grid lines (matches the reference look)
+            table_rows = "".join(
+                f'<tr style="background-color: {"#EAF2FF" if i % 2 else "#FFFFFF"};">'
+                f'<td style="padding:8px 16px; color:#2563eb; font-weight:500;">{row.SYMBOL}</td>'
+                f'<td style="padding:8px 16px; color:#374151;">{row.DATE}</td>'
+                f'</tr>'
+                for i, row in enumerate(day_df.itertuples())
+            )
+            st.markdown(f"""
+            <table style="width:320px; border-collapse:collapse; font-size:14px; border-radius:8px; overflow:hidden;">
+                <thead>
+                    <tr style="background-color:#DCE9FF;">
+                        <th style="text-align:left; padding:8px 16px; color:#1f2937; width:160px;">Symbol</th>
+                        <th style="text-align:left; padding:8px 16px; color:#1f2937; width:160px;">Date</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {table_rows}
+                </tbody>
+            </table>
+            """, unsafe_allow_html=True)
+
+        csv = result_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download full history as CSV", csv, "results.csv", "text/csv")
